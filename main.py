@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
@@ -44,7 +45,7 @@ if not api_key:
     print("❌ Error: Could not find API key in secrets.env")
 else:
     print("✅ Key found! Connecting to Gemini...")
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
     
     # Disable Safety Filters
     safety_settings = [
@@ -55,9 +56,9 @@ else:
     ]
 
     # Use the STABLE flash model
-    model = genai.GenerativeModel(
-        model_name='gemini-2.5-flash-preview-09-2025',
+    generate_config = types.GenerateContentConfig(
         safety_settings=safety_settings
+
     )
 
 # --- MEMORY STORAGE ---
@@ -77,7 +78,11 @@ def get_ai_reply(friend_name, incoming_text):
         full_prompt = f"{BOT_PERSONA}\n\nCONVERSATION HISTORY:\n{updated_context}\n\nMY REPLY:"
         
         # 4. Ask Gemini
-        response = model.generate_content(full_prompt)
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=full_prompt,
+            config=generate_config
+        )
         ai_reply = response.text.strip()
         
         # 5. Save the interaction back to memory
@@ -107,7 +112,8 @@ if __name__ == "__main__":
     driver = setup_browser()
     
     print("🤖 Bot is listening... (Press Ctrl+C to stop)")
-    last_processed_msg = "" 
+    # Change this from a string to a dictionary to track multiple chats
+    last_processed_msgs = {} 
 
     try:
         while True:
@@ -117,15 +123,13 @@ if __name__ == "__main__":
             if unread_badges:
                 print("📩 New message detected!")
                 
-                # --- OFFSET CLICK LOGIC (Preserved) ---
+                # --- OFFSET CLICK LOGIC ---
                 try:
                     badge = unread_badges[0]
-                    # Move mouse to the badge, then shift 50 pixels to the LEFT, then click
                     action = ActionChains(driver)
                     action.move_to_element(badge).move_by_offset(-50, 0).click().perform()
                 except Exception as e:
-                    print(f"Click error: {e}")
-                    # Backup: Try JS click
+                    print(f"Click error, trying JS click...")
                     driver.execute_script("arguments[0].click();", unread_badges[0])
                 
                 # Wait for chat to open
@@ -140,14 +144,11 @@ if __name__ == "__main__":
                     continue 
 
                 # --- GROUP DETECTION & NAME EXTRACTION ---
-                # Default name if extraction fails
                 current_chat_name = "Unknown" 
                 
                 try:
                     main_header = driver.find_element(By.XPATH, '//div[@id="main"]//header')
                     header_text = main_header.text
-                    
-                    # EXTRACT NAME: Take the first line (ignores 'online' status)
                     current_chat_name = header_text.splitlines()[0]
                     
                     print(f"🧐 Checking Chat Header: '{current_chat_name}'")
@@ -161,51 +162,86 @@ if __name__ == "__main__":
                     print(f"⚠️ Header check failed: {e}")
                     time.sleep(2)
                     continue
-                
-                # --- READ & REPLY ---
-                incoming_messages = driver.find_elements(By.CSS_SELECTOR, "div.message-in span.selectable-text")
-                
-                if incoming_messages:
-                    # 1. Check the very last message to see if it's new
-                    last_msg_text = incoming_messages[-1].text
+              
+                # --- READ & REPLY (Wrapped in try-except for debugging) ---
+                try:
+                    time.sleep(3)
                     
-                    if last_msg_text != last_processed_msg:
-                        print(f"👀 New conversation detected...")
+                    # Target the 'data-pre-plain-text' attribute
+                    all_messages = driver.find_elements(By.XPATH, '//div[@data-pre-plain-text]')
+                    
+                    if all_messages:
+                        last_msg = all_messages[-1]
+                        sender_info = last_msg.get_attribute("data-pre-plain-text") 
+                        last_msg_text = last_msg.text.strip()
                         
-                        # 2. BATCH READ: Grab the last 3 messages instead of just 1
-                        # This catches "Suggest a movie" + "Horror" sent together
-                        # [-3:] means "The last 3 items in the list"
-                        recent_messages = incoming_messages[-3:]
+                        is_incoming = current_chat_name in sender_info
                         
-                        # Combine them into one string with newlines
-                        combined_text = "\n".join([m.text for m in recent_messages])
-                        
-                        print(f"📜 Context read: {combined_text}")
-                        print("Thinking...")
-                        
-                        # 3. Send the COMBINED text to the Brain
-                        reply = get_ai_reply(current_chat_name, combined_text)
-                        print(f"🧠 Me: {reply}")
-                        
-                        # Type and Send
-                        input_box = driver.find_element(By.XPATH, '//div[@contenteditable="true"][@data-tab="10"]')
-                        input_box.click()
-                        input_box.send_keys(reply)
-                        time.sleep(3)
-                        input_box.send_keys(Keys.ENTER)
-                        print("✅ Reply sent!")
+                        # Use .get() to check the specific friend's last message
+                        if is_incoming and last_msg_text != last_processed_msgs.get(current_chat_name, ""):
+                            print(f"👀 New message from {current_chat_name} detected!")
+                            
+                            # Grab up to 5 messages for better context
+                            recent_messages = all_messages[-5:]
+                            
+                            # Build context block with proper sender labels
+                            formatted_context = []
+                            for m in recent_messages:
+                                text = m.text.strip()
+                                if not text: continue
+                                
+                                m_sender_info = m.get_attribute("data-pre-plain-text")
+                                if m_sender_info and current_chat_name in m_sender_info:
+                                    formatted_context.append(f"Friend: {text}")
+                                else:
+                                    formatted_context.append(f"Me: {text}")
+                                    
+                            combined_text = "\n".join(formatted_context)
+                            
+                            print(f"📜 Context read:\n{combined_text}")
+                            print("Thinking...")
+                            
+                            reply = get_ai_reply(current_chat_name, combined_text)
+                            print(f"🧠 Me: {reply}")
+                            
+                            input_box = driver.find_element(By.XPATH, '//*[@id="main"]//footer//div[@contenteditable="true"]')
+                            input_box.click()
+                            
+                            # FIX FOR SPAMMING: Split by newlines and use Shift+Enter
+                            lines = reply.split('\n')
+                            for i, line in enumerate(lines):
+                                input_box.send_keys(line)
+                                if i < len(lines) - 1:
+                                    # Shift+Enter adds a new line in WhatsApp without sending
+                                    action = ActionChains(driver)
+                                    action.key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).perform()
+                                    
+                            time.sleep(2)
+                            input_box.send_keys(Keys.ENTER)
+                            print("✅ Reply sent!")
 
-                        # Update Memory
-                        last_processed_msg = last_msg_text 
+                            # Update Memory for this specific friend
+                            last_processed_msgs[current_chat_name] = last_msg_text 
 
-                        # Refresh Logic
-                        print("🔄 Refreshing page to close chat...")
-                        time.sleep(2) 
-                        driver.refresh()
-                        time.sleep(10)
-                        
-                        continue 
+                            print("🔄 Refreshing page to close chat...")
+                            time.sleep(2) 
+                            driver.refresh()
+                            time.sleep(10)
+                            
+                        else:
+                            print("Last message was from me, or already replied. Refreshing...")
+                            driver.refresh()
+                            time.sleep(5)
                     else:
-                        print("I already replied to this one.")
+                        print("⚠️ Could not find 'data-pre-plain-text'. The chat might still be loading...")
+                        driver.refresh()
+                        time.sleep(5)
+
+                except Exception as loop_error:
+                    print(f"❌ Error during read/reply phase: {loop_error}")
+                    driver.refresh()
+                    time.sleep(5)
+               
+
     except KeyboardInterrupt:
-        print("🛑 Stopped.")                    
+        print("🛑 Stopped.")
